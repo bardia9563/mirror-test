@@ -23,19 +23,19 @@
     padding-top:env(safe-area-inset-top,0px);
     padding-bottom:env(safe-area-inset-bottom,0px);
   }
-  .stage{flex:1; min-height:0; display:flex; align-items:center; justify-content:center; padding:12px}
+  .stage{flex:1; min-height:0; display:flex; align-items:center; justify-content:center; padding:10px}
   canvas{width:100%; height:100%; object-fit:contain; border-radius:18px; background:#000}
   video{position:absolute; width:1px; height:1px; opacity:0; pointer-events:none}
   .intro{text-align:center; max-width:30ch; color:var(--muted)}
   .intro h1{font-size:1.6rem; line-height:1.15; color:var(--ink); margin:0 0 .5rem; letter-spacing:-.01em}
-  .panel{background:var(--panel); margin:0 12px 12px; border-radius:18px; padding:14px 16px}
-  #status{margin:0 0 12px; min-height:1.45em}
+  .panel{background:var(--panel); margin:0 10px 10px; border-radius:18px; padding:12px 14px}
+  #status{margin:0 0 10px; min-height:1.45em}
   #status.ok{color:var(--fit); font-weight:600}
-  .row{display:flex; gap:10px}
-  .row + .row{margin-top:10px}
+  .row{display:flex; gap:8px}
+  .row + .row{margin-top:8px}
   button{
-    flex:1; font:inherit; font-weight:600; border:0; border-radius:12px;
-    padding:12px 10px; background:var(--btn); color:var(--btn-ink);
+    flex:1; font:inherit; font-size:15px; font-weight:600; border:0; border-radius:12px;
+    padding:11px 8px; background:var(--btn); color:var(--btn-ink);
   }
   button.ghost{background:transparent; color:var(--ink); outline:2px solid var(--muted); outline-offset:-2px}
   button:disabled{opacity:.45}
@@ -46,16 +46,20 @@
   <div class="stage">
     <div class="intro" id="intro">
       <h1>Mirror fit test</h1>
-      <p>Stand in front of a mirror and point your back camera at your reflection. If a pink panel sticks to your chest, the idea works.</p>
+      <p>Stand in front of a mirror and point your back camera at your reflection to try on a hoodie.</p>
     </div>
     <canvas id="view" hidden></canvas>
   </div>
   <video id="cam" playsinline muted></video>
   <div class="panel">
-    <p id="status">Tap start, then allow the camera. (v3)</p>
+    <p id="status">Tap start, then allow the camera. (v4)</p>
     <div class="row">
       <button id="start">Start camera</button>
+      <button id="color" class="ghost" disabled>Color: Grey</button>
+    </div>
+    <div class="row">
       <button id="flip" class="ghost" disabled>Switch camera</button>
+      <button id="dots" class="ghost" disabled>Dots: off</button>
     </div>
     <div class="row">
       <button id="smooth" class="ghost" disabled>Smoothing: on</button>
@@ -64,79 +68,59 @@
   </div>
 
 <script type="module">
-const V = 'v3';
-const statusEl = document.getElementById('status');
-const startBtn = document.getElementById('start');
-const flipBtn = document.getElementById('flip');
-const smoothBtn = document.getElementById('smooth');
-const accBtn = document.getElementById('acc');
-const video = document.getElementById('cam');
-const canvas = document.getElementById('view');
-const ctx = canvas.getContext('2d');
-const intro = document.getElementById('intro');
+const V = 'v4';
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status'), startBtn = $('start'), flipBtn = $('flip'), smoothBtn = $('smooth'),
+      accBtn = $('acc'), colorBtn = $('color'), dotsBtn = $('dots');
+const video = $('cam'), canvas = $('view'), ctx = canvas.getContext('2d'), intro = $('intro');
 
 const BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
 const MODELS = {
   normal: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task',
   high: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task'
 };
+const COLORS = [
+  { name: 'Grey', hex: '#8e9096' }, { name: 'Black', hex: '#2c2c31' }, { name: 'Navy', hex: '#29365c' },
+  { name: 'Cream', hex: '#e6ddc9' }, { name: 'Forest', hex: '#3e5944' }, { name: 'Pink', hex: '#e08aa6' }
+];
 
 let PoseLandmarker = null, files = null, landmarker = null, stream = null, running = false;
-let facing = 'environment', accuracy = 'normal', smoothingOn = true;
+let facing = 'environment', accuracy = 'normal', smoothingOn = true, showDots = false, colorIdx = 0;
 let lastTs = -1, frames = 0, fps = 0, fpsClock = performance.now();
-let filters = [];
-let refWidth = 0, side = 0, flipCount = 0;      // left/right swap guard
-let lastQuad = null, lastGood = 0;              // hold last good pose briefly
+let filters = [], refWidth = 0, side = 0, flipCount = 0, lastFrame = null, lastGood = 0;
 
 function say(text, ok=false){ statusEl.textContent = text; statusEl.className = ok ? 'ok' : ''; }
+if (!window.isSecureContext) { say('This page needs an https link to use the camera. Open it from your GitHub Pages address.'); startBtn.disabled = true; }
 
-if (!window.isSecureContext) {
-  say('This page needs an https link to use the camera. Open it from your GitHub Pages address.');
-  startBtn.disabled = true;
-}
-
-// Adaptive smoothing: steady when still, fast when things move
+// ---------- adaptive smoothing ----------
 class LowPass { constructor(){ this.y = null; } run(x, a){ this.y = this.y === null ? x : a * x + (1 - a) * this.y; return this.y; } }
 class OneEuro {
-  constructor(minCutoff = 1.5, beta = 0.012, dCutoff = 1){
-    this.minCutoff = minCutoff; this.beta = beta; this.dCutoff = dCutoff;
-    this.x = new LowPass(); this.dx = new LowPass(); this.tPrev = null; this.xPrev = 0;
-  }
+  constructor(minCutoff = 1.5, beta = 0.012, dCutoff = 1){ this.minCutoff = minCutoff; this.beta = beta; this.dCutoff = dCutoff; this.x = new LowPass(); this.dx = new LowPass(); this.tPrev = null; this.xPrev = 0; }
   alpha(c, dt){ const tau = 1 / (2 * Math.PI * c); return 1 / (1 + tau / dt); }
   run(x, t){
     if (this.tPrev === null){ this.tPrev = t; this.xPrev = x; this.dx.run(0, 1); return this.x.run(x, 1); }
-    const dt = Math.max(0.001, (t - this.tPrev) / 1000);
-    this.tPrev = t;
-    const speed = this.dx.run((x - this.xPrev) / dt, this.alpha(this.dCutoff, dt));
-    this.xPrev = x;
+    const dt = Math.max(0.001, (t - this.tPrev) / 1000); this.tPrev = t;
+    const speed = this.dx.run((x - this.xPrev) / dt, this.alpha(this.dCutoff, dt)); this.xPrev = x;
     return this.x.run(x, this.alpha(this.minCutoff + this.beta * Math.abs(speed), dt));
   }
 }
 
+// ---------- model + camera ----------
 async function createLandmarker(){
   if (!PoseLandmarker) {
     const vision = await import(BASE + '/vision_bundle.mjs');
     PoseLandmarker = vision.PoseLandmarker;
     files = await vision.FilesetResolver.forVisionTasks(BASE + '/wasm');
   }
-  const opts = (delegate) => ({
-    baseOptions: { modelAssetPath: MODELS[accuracy], delegate },
-    runningMode: 'VIDEO', numPoses: 1
-  });
+  const opts = (delegate) => ({ baseOptions: { modelAssetPath: MODELS[accuracy], delegate }, runningMode: 'VIDEO', numPoses: 1 });
   try { return await PoseLandmarker.createFromOptions(files, opts('GPU')); }
   catch (e) { return await PoseLandmarker.createFromOptions(files, opts('CPU')); }
 }
-
-function resetTracking(){ filters = []; side = 0; flipCount = 0; lastQuad = null; }
-
+function resetTracking(){ filters = []; side = 0; flipCount = 0; lastFrame = null; }
 async function openCamera(){
   if (stream) stream.getTracks().forEach(t => t.stop());
-  stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 720 } },
-    audio: false
-  });
-  video.srcObject = stream;
-  await video.play();
+  stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+  video.srcObject = stream; await video.play();
   canvas.style.transform = facing === 'user' ? 'scaleX(-1)' : 'none';
   resetTracking();
 }
@@ -148,61 +132,62 @@ startBtn.addEventListener('click', async () => {
     say('Loading body tracking… (first time takes a few seconds)');
     if (!landmarker) landmarker = await createLandmarker();
     intro.hidden = true; canvas.hidden = false;
-    flipBtn.disabled = smoothBtn.disabled = accBtn.disabled = false;
-    startBtn.textContent = 'Running';
-    running = true;
+    [flipBtn, smoothBtn, accBtn, colorBtn, dotsBtn].forEach(b => b.disabled = false);
+    startBtn.textContent = 'Running'; running = true;
     say('Point the camera at your reflection. (' + V + ')');
     requestAnimationFrame(loop);
   } catch (e) {
-    console.error(e);
-    startBtn.disabled = false;
+    console.error(e); startBtn.disabled = false;
     if (e && e.name === 'NotAllowedError') say('Camera blocked. Go to Settings › Safari › Camera, choose Allow, then reload this page.');
     else say('Couldn’t start: ' + (e && e.message ? e.message : e) + '. Reload and try again.');
   }
 });
-
-flipBtn.addEventListener('click', async () => {
-  facing = facing === 'environment' ? 'user' : 'environment';
-  try { await openCamera(); } catch (e) { say('Couldn’t switch camera: ' + e.message); }
-});
-
-smoothBtn.addEventListener('click', () => {
-  smoothingOn = !smoothingOn; filters = [];
-  smoothBtn.textContent = 'Smoothing: ' + (smoothingOn ? 'on' : 'off');
-});
-
+flipBtn.addEventListener('click', async () => { facing = facing === 'environment' ? 'user' : 'environment'; try { await openCamera(); } catch (e) { say('Couldn’t switch camera: ' + e.message); } });
+smoothBtn.addEventListener('click', () => { smoothingOn = !smoothingOn; filters = []; smoothBtn.textContent = 'Smoothing: ' + (smoothingOn ? 'on' : 'off'); });
+dotsBtn.addEventListener('click', () => { showDots = !showDots; dotsBtn.textContent = 'Dots: ' + (showDots ? 'on' : 'off'); });
+colorBtn.addEventListener('click', () => { colorIdx = (colorIdx + 1) % COLORS.length; colorBtn.textContent = 'Color: ' + COLORS[colorIdx].name; });
 accBtn.addEventListener('click', async () => {
-  accBtn.disabled = true;
-  const next = accuracy === 'normal' ? 'high' : 'normal';
-  accBtn.textContent = 'Loading…';
-  const old = landmarker; landmarker = null;
-  accuracy = next;
-  try {
-    landmarker = await createLandmarker();
-    if (old) old.close();
-  } catch (e) {
-    accuracy = next === 'high' ? 'normal' : 'high';
-    landmarker = old;
-    say('Couldn’t load that model: ' + e.message);
-  }
-  accBtn.textContent = 'Accuracy: ' + accuracy;
-  accBtn.disabled = false;
-  resetTracking();
+  accBtn.disabled = true; accBtn.textContent = 'Loading…';
+  const old = landmarker, prev = accuracy; landmarker = null;
+  accuracy = accuracy === 'normal' ? 'high' : 'normal';
+  try { landmarker = await createLandmarker(); if (old) old.close(); }
+  catch (e) { accuracy = prev; landmarker = old; say('Couldn’t load that model: ' + e.message); }
+  accBtn.textContent = 'Accuracy: ' + accuracy; accBtn.disabled = false; resetTracking();
 });
 
-const BONES = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28]];
-const JOINTS = [0,11,12,13,14,15,16,23,24,25,26,27,28];
-const PAIRS = [[1,4],[2,5],[3,6],[7,8],[9,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,22],[23,24],[25,26],[27,28],[29,30],[31,32]];
+// ---------- geometry helpers ----------
 const seen = (p) => p && (p.visibility === undefined || p.visibility > 0.5);
+const sub = (a, b) => ({ x: a.x - b.x, y: a.y - b.y });
+const add = (a, b) => ({ x: a.x + b.x, y: a.y + b.y });
+const mul = (a, k) => ({ x: a.x * k, y: a.y * k });
+const dot = (a, b) => a.x * b.x + a.y * b.y;
+const len = (a) => Math.hypot(a.x, a.y);
+const unit = (a) => { const l = len(a) || 1; return { x: a.x / l, y: a.y / l }; };
+const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+const PAIRS = [[1,4],[2,5],[3,6],[7,8],[9,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,22],[23,24],[25,26],[27,28],[29,30],[31,32]];
 
-// The model sometimes swaps your left and right side in a single frame
-// (common when you face away). A real turn passes through a narrow side view,
-// so a sudden swap while your shoulders look wide is treated as a mistake.
-function fixSwaps(raw, w){
-  const dx = (raw[11].x - raw[12].x) * w;
-  const width = Math.abs(dx);
+// Which way is "down" along the body (works when the phone is tilted).
+// Uses midpoints, so it doesn't care if left/right got swapped.
+function bodyDown(lm, w, h){
+  const P = (i) => ({ x: lm[i].x * w, y: lm[i].y * h });
+  const S = mid(P(11), P(12));
+  if (seen(lm[23]) && seen(lm[24])) { const H = mid(P(23), P(24)); return { S, down: unit(sub(H, S)), torso: len(sub(H, S)), hips: true }; }
+  const sv = sub(P(11), P(12));
+  let d = unit({ x: -sv.y, y: sv.x });
+  const ref = seen(lm[0]) ? unit(sub(S, P(0))) : { x: 0, y: 1 };
+  if (dot(d, ref) < 0) d = mul(d, -1);
+  return { S, down: d, torso: null, hips: false };
+}
+
+// The model sometimes swaps your left and right side for a frame (common facing away).
+// A real turn passes through a narrow side view, so a sudden swap while wide is a mistake.
+function fixSwaps(raw, w, h){
+  const { down } = bodyDown(raw, w, h);
+  const across = { x: -down.y, y: down.x };
+  const s0 = dot(sub({ x: raw[11].x * w, y: raw[11].y * h }, { x: raw[12].x * w, y: raw[12].y * h }), across);
+  const width = Math.abs(s0);
   refWidth = Math.max(refWidth * 0.997, width);
-  const s = Math.sign(dx) || side;
+  const s = Math.sign(s0) || side;
   if (side === 0) { side = s; return raw; }
   if (s === side) { flipCount = 0; return raw; }
   flipCount++;
@@ -212,70 +197,131 @@ function fixSwaps(raw, w){
   return out;
 }
 
-function torsoQuad(lm, w, h){
-  const ls = lm[11], rs = lm[12], lh = lm[23], rh = lm[24];
-  if (!seen(ls) || !seen(rs)) return null;
-  const P = (p) => ({ x: p.x * w, y: p.y * h });
-  const a = P(ls), b = P(rs);
-  const sw = Math.max(1, Math.hypot(a.x - b.x, a.y - b.y));
-  let c, d;
-  if (seen(lh) && seen(rh)) { c = P(rh); d = P(lh); }
-  else {
-    const L = Math.max(sw, 0.45 * refWidth) * 1.35;
-    c = { x: b.x, y: b.y + L };
-    d = { x: a.x, y: a.y + L };
-  }
-  let pts = [a, b, c, d];
-  const cx = pts.reduce((s,p)=>s+p.x,0)/4, cy = pts.reduce((s,p)=>s+p.y,0)/4;
-  // Side view: shoulders overlap, so keep a believable body thickness
-  const minW = 0.45 * refWidth, topW = Math.abs(a.x - b.x);
-  const widen = topW < minW && topW > 0 ? Math.min(4, minW / topW) : 1;
-  return pts.map(p => ({ x: cx + (p.x - cx) * 1.15 * widen, y: cy + (p.y - cy) * 1.08 }));
+// Build a body frame: map(u, v) gives a point on the torso.
+// u: 0 = your right shoulder side, 1 = your left; v: 0 = shoulders, 1 = hips.
+function torsoFrame(lm, w, h){
+  if (!seen(lm[11]) || !seen(lm[12])) return null;
+  const P = (i) => ({ x: lm[i].x * w, y: lm[i].y * h });
+  const { S, down, torso, hips } = bodyDown(lm, w, h);
+  let across = { x: -down.y, y: down.x };
+  const s = dot(sub(P(11), P(12)), across);
+  if (s < 0) across = mul(across, -1);
+  const minW = 0.45 * refWidth;
+  const sw = Math.max(Math.abs(s), minW, 1);
+  const tl = torso || Math.max(sw, minW) * 1.35;
+  let hw = 0.88 * sw;
+  if (hips) hw = Math.min(1.1 * sw, Math.max(0.6 * sw, Math.abs(dot(sub(P(23), P(24)), across))));
+  const faceVis = [0, 2, 5].reduce((t, i) => t + (lm[i].visibility || 0), 0) / 3;
+  const map = (u, v) => {
+    const wv = sw + (hw - sw) * Math.min(1, Math.max(0, v));
+    return add(add(S, mul(down, v * tl)), mul(across, (u - 0.5) * wv));
+  };
+  return { map, sw, back: faceVis < 0.55 };
 }
 
-function drawQuad(q, alpha){
+// ---------- drawing ----------
+function shade(hex, k){
+  const n = parseInt(hex.slice(1), 16);
+  const r = Math.round(((n >> 16) & 255) * k), g = Math.round(((n >> 8) & 255) * k), b = Math.round((n & 255) * k);
+  return `rgb(${Math.min(255,r)},${Math.min(255,g)},${Math.min(255,b)})`;
+}
+function poly(f, pts){
   ctx.beginPath();
-  q.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+  pts.forEach(([u, v], i) => { const p = f.map(u, v); i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y); });
   ctx.closePath();
-  ctx.fillStyle = `rgba(255,61,139,${0.55 * alpha})`; ctx.fill();
-  ctx.lineWidth = Math.max(3, canvas.width / 220);
-  ctx.strokeStyle = `rgba(255,61,139,${alpha})`; ctx.stroke();
+}
+function line(f, a, b){ const p = f.map(...a), q = f.map(...b); ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y); ctx.stroke(); }
+
+function drawSleeve(f, startUV, elbow, wrist, base, dark, alpha){
+  if (!elbow) return;
+  const s = f.map(...startUV);
+  const pts = wrist ? [s, elbow, wrist] : [s, elbow];
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  // outline, then fabric
+  ctx.strokeStyle = dark; ctx.lineWidth = f.sw * 0.36;
+  ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); ctx.stroke();
+  ctx.strokeStyle = base; ctx.lineWidth = f.sw * 0.31;
+  ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); ctx.stroke();
+  if (wrist) { // ribbed cuff
+    const c0 = add(wrist, mul(sub(elbow, wrist), 0.18));
+    ctx.strokeStyle = dark; ctx.lineWidth = f.sw * 0.27;
+    ctx.beginPath(); ctx.moveTo(c0.x, c0.y); ctx.lineTo(wrist.x, wrist.y); ctx.stroke();
+  }
+}
+
+function drawHoodie(f, lm, w, h, alpha){
+  const base = COLORS[colorIdx].hex, dark = shade(base, 0.72), deep = shade(base, 0.55), light = shade(base, 1.12);
+  ctx.save(); ctx.globalAlpha = alpha;
+  const body = [[-0.07,0.02],[0.2,-0.01],[0.8,-0.01],[1.07,0.02],[1.05,0.55],[1.03,1.12],[-0.03,1.12],[-0.05,0.55]];
+
+  // body
+  poly(f, body); ctx.fillStyle = base; ctx.fill();
+  ctx.lineWidth = Math.max(2, f.sw * 0.018); ctx.strokeStyle = deep; ctx.lineJoin = 'round'; ctx.stroke();
+  // side shading so it reads as round, not flat
+  const L = f.map(-0.05, 0.5), R = f.map(1.05, 0.5);
+  const g = ctx.createLinearGradient(L.x, L.y, R.x, R.y);
+  g.addColorStop(0, 'rgba(0,0,0,0.32)'); g.addColorStop(0.22, 'rgba(0,0,0,0)');
+  g.addColorStop(0.5, 'rgba(255,255,255,0.06)'); g.addColorStop(0.78, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,0.32)');
+  poly(f, body); ctx.fillStyle = g; ctx.fill();
+  // ribbed hem
+  poly(f, [[-0.03,1.0],[1.03,1.0],[1.03,1.12],[-0.03,1.12]]); ctx.fillStyle = dark; ctx.fill();
+  ctx.strokeStyle = deep; ctx.lineWidth = Math.max(1, f.sw * 0.008);
+  for (let u = 0.04; u < 1.0; u += 0.06) line(f, [u, 1.01], [u, 1.11]);
+
+  if (!f.back) {
+    // kangaroo pocket
+    poly(f, [[0.22,0.64],[0.78,0.64],[0.86,0.95],[0.14,0.95]]); ctx.fillStyle = shade(base, 0.93); ctx.fill();
+    ctx.strokeStyle = deep; ctx.lineWidth = Math.max(2, f.sw * 0.015); ctx.stroke();
+    ctx.strokeStyle = dark; line(f, [0.22,0.64], [0.15,0.82]); line(f, [0.78,0.64], [0.85,0.82]);
+    // hood lying around the neck
+    poly(f, [[0.18,0.05],[0.27,-0.1],[0.5,-0.16],[0.73,-0.1],[0.82,0.05],[0.64,0.11],[0.5,0.07],[0.36,0.11]]);
+    ctx.fillStyle = dark; ctx.fill(); ctx.strokeStyle = deep; ctx.stroke();
+    // drawstrings
+    ctx.strokeStyle = light; ctx.lineCap = 'round'; ctx.lineWidth = Math.max(2, f.sw * 0.02);
+    line(f, [0.43,0.08], [0.41,0.36]); line(f, [0.57,0.08], [0.59,0.36]);
+    ctx.fillStyle = deep;
+    for (const p of [f.map(0.41,0.38), f.map(0.59,0.38)]) { ctx.beginPath(); ctx.arc(p.x, p.y, Math.max(2, f.sw * 0.022), 0, Math.PI*2); ctx.fill(); }
+  } else {
+    // hood hanging down the back
+    poly(f, [[0.22,0.0],[0.5,-0.07],[0.78,0.0],[0.72,0.28],[0.5,0.38],[0.28,0.28]]);
+    ctx.fillStyle = dark; ctx.fill(); ctx.strokeStyle = deep; ctx.lineWidth = Math.max(2, f.sw * 0.015); ctx.stroke();
+    ctx.strokeStyle = 'rgba(0,0,0,0.18)'; line(f, [0.5,-0.04], [0.5,0.34]);
+  }
+
+  // sleeves (drawn last so an arm across the chest stays in front)
+  const P = (i) => seen(lm[i]) ? { x: lm[i].x * w, y: lm[i].y * h } : null;
+  drawSleeve(f, [1.0, 0.07], P(13), P(15), base, deep, alpha);
+  drawSleeve(f, [0.0, 0.07], P(14), P(16), base, deep, alpha);
+  ctx.restore();
+}
+
+const BONES = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28]];
+const JOINTS = [0,11,12,13,14,15,16,23,24,25,26,27,28];
+function drawDots(lm, w, h){
+  ctx.lineWidth = Math.max(2, w / 300); ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+  for (const [i, j] of BONES) { if (!seen(lm[i]) || !seen(lm[j])) continue; ctx.beginPath(); ctx.moveTo(lm[i].x * w, lm[i].y * h); ctx.lineTo(lm[j].x * w, lm[j].y * h); ctx.stroke(); }
+  const r = Math.max(4, w / 160); ctx.fillStyle = '#fff';
+  for (const k of JOINTS) { if (!seen(lm[k])) continue; ctx.beginPath(); ctx.arc(lm[k].x * w, lm[k].y * h, r, 0, Math.PI * 2); ctx.fill(); }
 }
 
 function draw(res, w, h, now){
   let raw = res && res.landmarks && res.landmarks[0];
-  const torsoOk = raw && [11,12].every(i => seen(raw[i]));
-
-  if (!torsoOk) {
-    if (lastQuad && now - lastGood < 500) { drawQuad(lastQuad, 0.5); say(`Holding last position… · ${fps} fps · ${V}`, true); }
+  if (!raw || !seen(raw[11]) || !seen(raw[12])) {
+    if (lastFrame && now - lastGood < 500) { drawHoodie(lastFrame.f, lastFrame.lm, w, h, 0.6); say(`Holding last position · ${fps} fps · ${V}`, true); }
     else { resetTracking(); say('No body found. Step back so your upper body fits in the mirror. (' + V + ')'); }
     return;
   }
-
-  raw = fixSwaps(raw, w);
+  raw = fixSwaps(raw, w, h);
   const lm = smoothingOn
     ? raw.map((p, i) => {
         if (!filters[i]) filters[i] = { x: new OneEuro(), y: new OneEuro() };
         return { x: filters[i].x.run(p.x * w, now) / w, y: filters[i].y.run(p.y * h, now) / h, visibility: p.visibility };
       })
     : raw;
-
-  const quad = torsoQuad(lm, w, h);
-  if (quad) { drawQuad(quad, 1); lastQuad = quad; lastGood = now; }
-
-  ctx.lineWidth = Math.max(2, w / 300);
-  ctx.strokeStyle = 'rgba(255,255,255,0.9)';
-  for (const [i, j] of BONES) {
-    if (!seen(lm[i]) || !seen(lm[j])) continue;
-    ctx.beginPath(); ctx.moveTo(lm[i].x * w, lm[i].y * h); ctx.lineTo(lm[j].x * w, lm[j].y * h); ctx.stroke();
-  }
-  const r = Math.max(4, w / 160);
-  ctx.fillStyle = '#ffffff';
-  for (const k of JOINTS) {
-    if (!seen(lm[k])) continue;
-    ctx.beginPath(); ctx.arc(lm[k].x * w, lm[k].y * h, r, 0, Math.PI * 2); ctx.fill();
-  }
-  say(`Body tracked · ${fps} fps · ${V}`, true);
+  const f = torsoFrame(lm, w, h);
+  if (f) { drawHoodie(f, lm, w, h, 1); lastFrame = { f, lm }; lastGood = now; }
+  if (showDots) drawDots(lm, w, h);
+  say(`Hoodie on${f && f.back ? ' (back)' : ''} · ${fps} fps · ${V}`, true);
 }
 
 function loop(){
