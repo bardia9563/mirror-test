@@ -70,7 +70,25 @@ const intro = document.getElementById('intro');
 let landmarker = null, stream = null, running = false;
 let facing = 'environment';
 let lastTs = -1, frames = 0, fps = 0, fpsClock = performance.now();
-let smooth = null;
+let filters = [];
+
+// Adaptive smoothing: steady when you hold still, fast when things move
+class LowPass { constructor(){ this.y = null; } run(x, a){ this.y = this.y === null ? x : a * x + (1 - a) * this.y; return this.y; } }
+class OneEuro {
+  constructor(minCutoff = 1.5, beta = 0.012, dCutoff = 1){
+    this.minCutoff = minCutoff; this.beta = beta; this.dCutoff = dCutoff;
+    this.x = new LowPass(); this.dx = new LowPass(); this.tPrev = null; this.xPrev = 0;
+  }
+  alpha(cutoff, dt){ const tau = 1 / (2 * Math.PI * cutoff); return 1 / (1 + tau / dt); }
+  run(x, t){
+    if (this.tPrev === null){ this.tPrev = t; this.xPrev = x; this.dx.run(0, 1); return this.x.run(x, 1); }
+    const dt = Math.max(0.001, (t - this.tPrev) / 1000);
+    this.tPrev = t;
+    const speed = this.dx.run((x - this.xPrev) / dt, this.alpha(this.dCutoff, dt));
+    this.xPrev = x;
+    return this.x.run(x, this.alpha(this.minCutoff + this.beta * Math.abs(speed), dt));
+  }
+}
 
 function say(text, ok=false){ statusEl.textContent = text; statusEl.className = ok ? 'ok' : ''; }
 
@@ -104,7 +122,7 @@ async function openCamera(){
   video.srcObject = stream;
   await video.play();
   canvas.style.transform = facing === 'user' ? 'scaleX(-1)' : 'none';
-  smooth = null;
+  filters = [];
 }
 
 startBtn.addEventListener('click', async () => {
@@ -160,14 +178,19 @@ function torsoQuad(lm, w, h){
 }
 
 function draw(res, w, h){
-  const lm = res && res.landmarks && res.landmarks[0];
-  if (!lm) { smooth = null; say('No body found. Step back so your upper body fits in the mirror.'); return; }
+  const raw = res && res.landmarks && res.landmarks[0];
+  if (!raw) { filters = []; say('No body found. Step back so your upper body fits in the mirror.'); return; }
+
+  const t = performance.now();
+  const lm = raw.map((p, i) => {
+    if (!filters[i]) filters[i] = { x: new OneEuro(), y: new OneEuro() };
+    return { x: filters[i].x.run(p.x * w, t) / w, y: filters[i].y.run(p.y * h, t) / h, visibility: p.visibility };
+  });
 
   const quad = torsoQuad(lm, w, h);
   if (quad) {
-    smooth = smooth ? smooth.map((s, i) => ({ x: s.x * 0.6 + quad[i].x * 0.4, y: s.y * 0.6 + quad[i].y * 0.4 })) : quad;
     ctx.beginPath();
-    smooth.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+    quad.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
     ctx.closePath();
     ctx.fillStyle = 'rgba(255,61,139,0.55)'; ctx.fill();
     ctx.lineWidth = Math.max(3, w / 220); ctx.strokeStyle = '#ff3d8b'; ctx.stroke();
